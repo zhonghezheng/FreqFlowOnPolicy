@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+workdir/
+wandb/
+assets/
+slurm/logs/

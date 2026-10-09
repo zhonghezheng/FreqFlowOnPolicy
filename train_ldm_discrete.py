@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 import tempfile
 from absl import logging
 import builtins
+import contextlib
 import os
 import wandb
 import libs.autoencoder
@@ -204,8 +205,9 @@ def train(config):
     config.mixed_precision = accelerator.mixed_precision
     config = ml_collections.FrozenConfigDict(config)
 
-    assert config.train.batch_size % accelerator.num_processes == 0
-    mini_batch_size = config.train.batch_size // accelerator.num_processes
+    accum = config.train.get('grad_accum', 1)  # micro-batches per optimizer step
+    assert config.train.batch_size % (accelerator.num_processes * accum) == 0
+    mini_batch_size = config.train.batch_size // (accelerator.num_processes * accum)
 
     if accelerator.is_main_process:
         os.makedirs(config.ckpt_root, exist_ok=True)
@@ -232,6 +234,8 @@ def train(config):
         train_state.nnet, train_state.nnet_ema, train_state.optimizer, train_dataset_loader)
     lr_scheduler = train_state.lr_scheduler
     train_state.resume(config.ckpt_root)
+    if train_state.step > 0:  # a resumed job must not replay the first job's data order and noise
+        accelerate.utils.set_seed(config.seed + train_state.step, device_specific=True)
 
     if config.autoencoder.pretrained_path.endswith("ckpt"):
         autoencoder = libs.vae.AutoencoderKL(embed_dim=16, ch_mult=(1,1,2,2,4), ckpt_path=config.autoencoder.pretrained_path)
@@ -262,14 +266,19 @@ def train(config):
     logging.info(f'use {_schedule}')
 
 
-    def train_step(_batch):
+    def train_step(_batches):
         _metrics = dict()
         optimizer.zero_grad()
-        _z = autoencoder.sample(_batch[0]) if 'feature' in config.dataset.name else encode(_batch[0])
-        loss_fn = SILoss()
-        loss = loss_fn(nnet, _z, loss_coeffs=config.loss_coeffs, y=_batch[1])
-        _metrics['loss'] = accelerator.gather(loss.detach()).mean()
-        accelerator.backward(loss.mean() / 2)
+        losses = []
+        for i, _batch in enumerate(_batches):
+            # only the last micro-batch's backward all-reduces
+            with contextlib.nullcontext() if i == len(_batches) - 1 else accelerator.no_sync(nnet):
+                _z = autoencoder.sample(_batch[0]) if 'feature' in config.dataset.name else encode(_batch[0])
+                loss_fn = SILoss()
+                loss = loss_fn(nnet, _z, loss_coeffs=config.loss_coeffs, y=_batch[1])
+                accelerator.backward(loss.mean() / 2 / len(_batches))
+            losses.append(loss.detach())
+        _metrics['loss'] = accelerator.gather(torch.cat(losses)).mean()
         optimizer.step()
         lr_scheduler.step()
         train_state.ema_update(config.get('ema_rate', 0.9999))
@@ -282,8 +291,8 @@ def train(config):
     step_fid = []
     while train_state.step < config.train.n_steps:
         nnet.train()
-        batch = tree_map(lambda x: x.to(device), next(data_generator))
-        metrics = train_step(batch)
+        batches = [tree_map(lambda x: x.to(device), next(data_generator)) for _ in range(accum)]
+        metrics = train_step(batches)
 
         nnet.eval()
         if accelerator.is_main_process and train_state.step % config.train.log_interval == 0:
@@ -307,18 +316,22 @@ def train(config):
         if train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
             torch.cuda.empty_cache()
             logging.info(f'Save and eval checkpoint {train_state.step}...')
-            if accelerator.local_process_index == 0:
-                train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
+            if accelerator.is_main_process:
+                # write under a name resume() ignores, then rename, so a job killed mid-save
+                # never leaves a half-written .ckpt for the next job to resume from
+                tmp = os.path.join(config.ckpt_root, f'{train_state.step}.tmp')
+                train_state.save(tmp)
+                os.replace(tmp, os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
             accelerator.wait_for_everyone()
             
         accelerator.wait_for_everyone()
 
     logging.info(f'Finish fitting, step={train_state.step}')
     logging.info(f'step_fid: {step_fid}')
-    step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
-    logging.info(f'step_best: {step_best}')
-    train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
-    del metrics
+    if step_fid:  # nothing appends to it in this script
+        step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
+        logging.info(f'step_best: {step_best}')
+        train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
     accelerator.wait_for_everyone()
 
 
