@@ -78,7 +78,7 @@ tpu create v6 --name freqflow-onpolicy -n 8 ... -- bash tpu/bash_scripts/train_o
 
 Re-running a script resumes the run; bumping `RUN_TAG` starts a fresh one. The scripts expect the data under
 `gs://$GCS_BUCKET/$DATA_PREFIX/`, by default `v6_east1d` and `freqflow`. Logs, metrics and sample-grid latents
-are written locally and copied to `$OUTPUT_DIR/logs` at every checkpoint.
+are written locally and copied to `$OUTPUT_DIR/logs` at every checkpoint. A restarted run pulls them back first, so the history continues.
 
 ## Setup by hand
 
@@ -116,9 +116,17 @@ python tpu/train_onpolicy.py --config=tpu/tpu_configs/freqflow_onpolicy.py --con
 ```
 
 - Any config value can be overridden on the command line, as on GPU.
-- A run resumes from the latest checkpoint in `<workdir>/ckpts`. Batches are a pure function of the step,
-  so the data order continues exactly.
-- `<workdir>/export/<step>_nnet_ema.npz` holds the EMA in PyTorch layout.
+- **Preemption-safe.** A checkpoint is written every 1,000 steps (`train.save_interval`) and as soon as the
+  TPU signals preemption. Under `--distributed`, JAX's preemption service turns the SIGTERM into a step all hosts
+  agree on, then the run saves and exits. Re-running the same command resumes from the latest checkpoint in
+  `<workdir>/ckpts`, which holds the weights, EMA, AdamW state and step:
+  - **Data order:** batches are a pure function of the step (a seeded permutation per epoch), so the shuffled
+    order continues mid-epoch exactly.
+  - **Randomness:** the noise is `fold_in(seed, step)`.
+  - **Atomic saves:** checkpoints are finalized atomically, so one cut short is never restored.
+- **Retention:** only the latest 3 checkpoints are kept (`tpu.max_to_keep`).
+- **EMA export:** the EMA alone is written as a torch-keyed `.npz`, `<workdir>/export/<step>_nnet_ema.npz`, every
+  `tpu.export_interval` steps (50k; 2k for on-policy) and at the end. These are kept, for FID.
 
 TPU settings (`config.tpu`):
 
@@ -128,7 +136,8 @@ TPU settings (`config.tpu`):
 | `remat` | Recompute every block and the skip bridge in backward (on by default). |
 | `lowres_chunks` | Run the skip bridge (38,400 channels for L, 66,816 for H) in batch chunks. Its backward is the activation peak. |
 | `shard_params` | Also shard the weights over chips (FSDP). The EMA, optimizer state and accumulated gradients are always sharded (ZeRO-style). |
-| `export_npz` | Write the torch-keyed EMA at every checkpoint. |
+| `export_npz` | Write the torch-keyed EMA every `export_interval` steps. |
+| `max_to_keep` | Checkpoints kept (latest first). |
 
 ## Evaluation
 

@@ -106,7 +106,9 @@ def main(argv):
     n_params = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(abs_state['params']))
     log.info(f'nnet has {n_params} parameters')
     ckpt_dir = os.path.join(workdir, 'ckpts')
-    manager = common.checkpoint_manager(ckpt_dir if ckpt_dir.startswith('gs://') else os.path.abspath(ckpt_dir))
+    manager = common.checkpoint_manager(ckpt_dir if ckpt_dir.startswith('gs://') else os.path.abspath(ckpt_dir),
+                                        t.max_to_keep)
+    preemption = common.Preemption()
     step = 0
     if manager.latest_step() is not None:
         state, step = common.restore_checkpoint(manager, abs_state, shardings)
@@ -143,13 +145,18 @@ def main(argv):
                 os.makedirs(os.path.join(common.local_dir(workdir), 'samples'), exist_ok=True)
                 np.savez(os.path.join(common.local_dir(workdir), 'samples', f'{step}.npz'), latents=z,
                          labels=np.asarray(grid_y))
-        if step % config.train.save_interval == 0 or step == config.train.n_steps:
-            log.info(f'Save checkpoint {step}...')
+        preempted = preemption(step)
+        if step % config.train.save_interval == 0 or step == config.train.n_steps or preempted:
+            log.info(f'Save checkpoint {step}' + (' (preemption)...' if preempted else '...'))
             common.save_checkpoint(manager, state, step)
-            if t.export_npz:
+            if t.export_npz and (step % t.export_interval == 0 or step == config.train.n_steps):
                 common.export_torch_npz(state['ema'], config.nnet.model_args,
                                         os.path.join(workdir, 'export', f'{step}_nnet_ema.npz'))
             common.sync_logs(workdir)
+        if preempted:
+            manager.wait_until_finished()
+            log.info(f'Preempted: saved step {step}; re-run the same command to resume')
+            return
     manager.wait_until_finished()
     log.info(f'Finish fitting, step={step}')
 

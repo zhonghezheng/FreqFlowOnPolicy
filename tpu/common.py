@@ -4,6 +4,7 @@ import importlib.util
 import json
 import logging as pylogging
 import os
+import signal
 import sys
 import time
 
@@ -178,9 +179,32 @@ def ema_update(ema, params, rate):
 
 # --- checkpoints ---
 
-def checkpoint_manager(ckpt_dir):
+def checkpoint_manager(ckpt_dir, max_to_keep=None):
+    """Checkpoints are finalized atomically, so one cut short by preemption is never restored; only the latest
+    max_to_keep are kept (None: all)."""
     import orbax.checkpoint as ocp
-    return ocp.CheckpointManager(ckpt_dir, options=ocp.CheckpointManagerOptions(create=True))
+    return ocp.CheckpointManager(ckpt_dir, options=ocp.CheckpointManagerOptions(create=True, max_to_keep=max_to_keep))
+
+
+class Preemption:
+    """Call with the step after every step, on every host; True means save now and stop. Under jax.distributed
+    (TPU slices), JAX's preemption service turns the scheduler's SIGTERM into a step all hosts agree on. A single
+    process without it catches SIGTERM itself (installing that handler under the service would replace JAX's)."""
+
+    def __init__(self):
+        self.service = jax.distributed.is_initialized()
+        self.flag = False
+        if not self.service:
+            signal.signal(signal.SIGTERM, lambda *_: setattr(self, 'flag', True))
+
+    def __call__(self, step):
+        if self.service:
+            from jax.experimental import multihost_utils
+            try:
+                return multihost_utils.reached_preemption_sync_point(step)
+            except RuntimeError:  # preemption service disabled
+                return False
+        return self.flag
 
 
 def save_checkpoint(manager, state, step):
@@ -232,6 +256,16 @@ def sync_logs(workdir):
                        check=False)
 
 
+def pull_logs(workdir):
+    """After a restart on a new VM: fetch <workdir>/logs into the (empty) local mirror first, so the run's log,
+    metrics and sample grids continue instead of being overwritten by the next sync (host 0)."""
+    if workdir.startswith('gs://') and jax.process_index() == 0:
+        import subprocess
+        os.makedirs(local_dir(workdir), exist_ok=True)
+        subprocess.run(['gcloud', 'storage', 'rsync', '-r', workdir.rstrip('/') + '/logs', local_dir(workdir)],
+                       check=False, capture_output=True)
+
+
 class Logger:
     """Host 0 logs to stdout and <local_dir>/output.log, metrics as JSON lines in <local_dir>/metrics.jsonl and,
     with wandb_project set and WANDB_API_KEY in the environment, to Weights & Biases."""
@@ -240,6 +274,7 @@ class Logger:
         self.main = jax.process_index() == 0
         self.metrics_path, self.wandb = None, None
         if self.main:
+            pull_logs(workdir)
             local = local_dir(workdir)
             os.makedirs(local, exist_ok=True)
             handler = pylogging.FileHandler(os.path.join(local, 'output.log'))

@@ -21,5 +21,10 @@ def get_config():
         prefetch=2,
         export_npz=True,          # write the EMA as a torch-keyed .npz at every checkpoint, for the GPU tools
         wandb_project='',         # log metrics to W&B (needs WANDB_API_KEY in the environment)
+        # preemptible TPUs: checkpoint every train.save_interval (1000) steps and on a preemption notice, keeping
+        # only the latest max_to_keep; the EMA alone is exported as .npz every export_interval steps (for FID)
+        max_to_keep=3,
+        export_interval=50000,
     ))
+    config.train.save_interval = 1000
     return config
