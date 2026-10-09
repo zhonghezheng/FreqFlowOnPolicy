@@ -17,6 +17,7 @@ import os
 import wandb
 import libs.autoencoder
 import libs.vae
+import fid_eval
 import numpy as np
 from fft2d import Fourier_filter
 from sde import multi_scale_targets
@@ -192,12 +193,16 @@ def LSimple(x0, nnet, schedule, loss_coeffs, scaling_factor, **kwargs):
 
 
 def train(config):
+    # without it, fragmentation runs the large per-GPU batches out of memory; read at the first CUDA allocation
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
     if config.get('benchmark', False):
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
 
     mp.set_start_method('spawn')
-    accelerator = accelerate.Accelerator()
+    # grads as views into DDP's buckets, instead of a second full-size fp32 copy
+    accelerator = accelerate.Accelerator(
+        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(gradient_as_bucket_view=True)])
     device = accelerator.device
     accelerate.utils.set_seed(config.seed, device_specific=True)
     logging.info(f'Process {accelerator.process_index} using device: {device}')
@@ -230,18 +235,48 @@ def train(config):
                                       num_workers=8, pin_memory=True, persistent_workers=True)
 
     train_state = utils.initialize_train_state(config, device)
-    nnet, nnet_ema, optimizer, train_dataset_loader = accelerator.prepare(
-        train_state.nnet, train_state.nnet_ema, train_state.optimizer, train_dataset_loader)
+    if config.nnet.name == 'freqflow':  # memory/speed options: same math, up to float rounding
+        import torch._functorch.config
+        from libs.ours.blocks_RoPERMSNorm import ConvNeXtBlock, Stage, TransformerBlock
+        # the partitioner of compiled blocks recomputes cheap ops in backward until saved activations fit the
+        # budget (1.0 saves everything)
+        torch._functorch.config.activation_memory_budget = config.train.get('activation_memory_budget', 1.0)
+        for m in train_state.nnet.modules():
+            if isinstance(m, Stage):
+                m.checkpoint_lowres = config.train.get('checkpoint_lowres', False)
+            if isinstance(m, (TransformerBlock, ConvNeXtBlock)):
+                m.checkpoint = config.train.get('checkpoint_blocks', False)
+                if config.train.get('compile', False):
+                    m.compile()  # block by block: the identical blocks of a stage share one compiled graph
+    # the EMA is never backpropagated: wrapping it in DDP would allocate a full set of gradient buckets for it
+    train_state.nnet_ema.requires_grad_(False)
+    zero = utils.is_zero(train_state.optimizer)
+    nnet, optimizer, train_dataset_loader = accelerator.prepare(
+        train_state.nnet, train_state.optimizer, train_dataset_loader,
+        device_placement=[True, not zero, True])  # placing a ZeRO optimizer would call state_dict() unconsolidated
+    nnet_ema = train_state.nnet_ema
+    train_state.ema_update(0)  # restart the EMA from the weights DDP just broadcast from rank 0
     lr_scheduler = train_state.lr_scheduler
     train_state.resume(config.ckpt_root)
     if train_state.step > 0:  # a resumed job must not replay the first job's data order and noise
         accelerate.utils.set_seed(config.seed + train_state.step, device_specific=True)
+    ema = None
+    if zero:
+        # each rank keeps the EMA of only its optimizer shard; the full EMA module stays on the CPU and is
+        # assembled there to sample and to save
+        ema = utils.ShardedEMA(train_state.nnet, nnet_ema, train_state.optimizer)
+        nnet_ema.to('cpu')
+        torch.cuda.empty_cache()
 
     if config.autoencoder.pretrained_path.endswith("ckpt"):
         autoencoder = libs.vae.AutoencoderKL(embed_dim=16, ch_mult=(1,1,2,2,4), ckpt_path=config.autoencoder.pretrained_path)
     else:
         autoencoder = libs.autoencoder.get_model(config.autoencoder.pretrained_path)
-    autoencoder.to(device)
+    # training on precomputed features only calls autoencoder.sample, which uses no weights: keep the VAE on the
+    # CPU then, and bring it over only to decode the sample grid
+    features = 'feature' in config.dataset.name and not config.autoencoder.pretrained_path.endswith("ckpt")
+    vae_device = 'cpu' if features else device
+    autoencoder.to(vae_device)
 
     @ torch.cuda.amp.autocast()
     def encode(_batch):
@@ -253,6 +288,27 @@ def train(config):
             return autoencoder.decode(_batch / 0.2325)
         else:
             return autoencoder.decode(_batch)
+
+    def evaluate_fid():
+        # every rank samples its share from the full EMA model; the training step's activations are freed by now
+        if ema is not None:
+            ema.gather(nnet_ema, here=True)
+        nnet_ema.to(device)
+        autoencoder.to(device)
+        torch.cuda.empty_cache()
+
+        def sample_fn(y, z):
+            z = sampler.euler_sampler(nnet_ema, z, y, num_steps=config.fid.num_steps, cfg_scale=config.fid.cfg_scale,
+                                      guidance_high=config.fid.guidance_high).float()
+            return dataset.unpreprocess(torch.cat([decode(c) for c in z.split(50)]))  # the decoder is large
+
+        value = fid_eval.fid(sample_fn, config.fid.n_samples, config.fid.mini_batch_size, dataset.fid_stat,
+                             config.z_shape, device, seed=config.seed)
+        if zero:
+            nnet_ema.to('cpu')
+        autoencoder.to(vae_device)
+        torch.cuda.empty_cache()
+        return value
 
     def get_data_generator():
         while True:
@@ -281,14 +337,16 @@ def train(config):
         _metrics['loss'] = accelerator.gather(torch.cat(losses)).mean()
         optimizer.step()
         lr_scheduler.step()
-        train_state.ema_update(config.get('ema_rate', 0.9999))
+        if ema is None:
+            train_state.ema_update(config.get('ema_rate', 0.9999))
+        else:
+            ema.update(config.get('ema_rate', 0.9999))
         train_state.step += 1
         return dict(lr=train_state.optimizer.param_groups[0]['lr'], **_metrics)
 
 
     logging.info(f'Start fitting, step={train_state.step}, mixed_precision={config.mixed_precision}')
 
-    step_fid = []
     while train_state.step < config.train.n_steps:
         nnet.train()
         batches = [tree_map(lambda x: x.to(device), next(data_generator)) for _ in range(accum)]
@@ -300,9 +358,13 @@ def train(config):
             logging.info(config.workdir)
             wandb.log(metrics, step=train_state.step)
 
+        if ema is not None and train_state.step % config.train.eval_interval == 0:
+            ema.gather(nnet_ema, here=accelerator.is_main_process)
         if accelerator.is_main_process and train_state.step % config.train.eval_interval == 0:
             torch.cuda.empty_cache()
             logging.info('Save a grid of images...')
+            nnet_ema.to(device)
+            autoencoder.to(device)
             y = einops.repeat(torch.arange(5, device=device) % dataset.K, 'nrow -> (nrow ncol)', ncol=10)
             z_init = torch.randn(5 * 10, *config.z_shape, device=device)
             z = sampler.euler_sampler(nnet_ema,z_init, y)
@@ -310,28 +372,45 @@ def train(config):
             samples = make_grid(dataset.unpreprocess(samples), 10)
             save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
             wandb.log({'samples': wandb.Image(samples)}, step=train_state.step)
+            if zero:
+                nnet_ema.to('cpu')
+            autoencoder.to(vae_device)
             torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
 
         if train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
             torch.cuda.empty_cache()
             logging.info(f'Save and eval checkpoint {train_state.step}...')
+            if zero:  # collective: assemble the full optimizer state and EMA on the main process's CPU
+                train_state.optimizer.consolidate_state_dict(to=0)
+                ema.gather(nnet_ema, here=accelerator.is_main_process)
             if accelerator.is_main_process:
                 # write under a name resume() ignores, then rename, so a job killed mid-save
                 # never leaves a half-written .ckpt for the next job to resume from
                 tmp = os.path.join(config.ckpt_root, f'{train_state.step}.tmp')
                 train_state.save(tmp)
                 os.replace(tmp, os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
+            if zero:
+                train_state.optimizer._all_state_dicts = []  # drop the consolidated copy once written
             accelerator.wait_for_everyone()
+            if 'fid' in config and train_state.step >= config.fid.start:
+                logging.info(f'FID-{config.fid.n_samples} of the EMA model at step {train_state.step}...')
+                value = evaluate_fid()
+                if accelerator.is_main_process:
+                    logging.info(f'step {train_state.step}: FID-{config.fid.n_samples} {value:.4f}')
+                    wandb.log({'fid': value}, step=train_state.step)
+                    with open(os.path.join(config.workdir, 'fid.txt'), 'a') as f:
+                        f.write(f'{train_state.step} {value:.4f}\n')
+                accelerator.wait_for_everyone()
             
         accelerator.wait_for_everyone()
 
     logging.info(f'Finish fitting, step={train_state.step}')
-    logging.info(f'step_fid: {step_fid}')
-    if step_fid:  # nothing appends to it in this script
-        step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
-        logging.info(f'step_best: {step_best}')
-        train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
+    fid_log = os.path.join(config.workdir, 'fid.txt')  # also holds the evaluations of earlier, resumed jobs
+    if accelerator.is_main_process and os.path.exists(fid_log):
+        step_fid = [(int(step), float(value)) for step, value in (line.split() for line in open(fid_log))]
+        logging.info(f'step_fid: {step_fid}')
+        logging.info(f'step_best: {min(step_fid, key=lambda x: x[1])[0]}')
     accelerator.wait_for_everyone()
 
 

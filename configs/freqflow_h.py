@@ -64,6 +64,13 @@ def get_config():
     config.train = d(
         n_steps=500448,  # 800 epochs at batch 2048 (paper Table 10)
         batch_size=2048,
+        grad_accum=1,  # micro-batches per optimizer step; batch_size is the global batch (256 per GPU on 8 x 80 GB)
+        compile=True,  # compile each block: ~1.7x faster than eager
+        # recompute the blocks and the 66816-channel skip concat in backward: 0.24 GiB of activations per sample
+        # instead of 1.5, at no net speed cost with compile
+        checkpoint_blocks=True,
+        checkpoint_lowres=True,
+        activation_memory_budget=1.0,  # < 1 recomputes inside compiled blocks instead; 0.3 fits 64 per GPU without checkpointing
         mode='cond',
         log_interval=100,
         eval_interval=5000,
@@ -75,6 +82,7 @@ def get_config():
         lr=0.0002,
         weight_decay=0.03,
         betas=(0.99, 0.99),
+        zero=True,  # shard the AdamW state across GPUs instead of a full copy on each
     )
 
     config.lr_scheduler = d(
@@ -94,6 +102,15 @@ def get_config():
         path='/tmp/rsc/DataSet/imagenet_sd_ema_feature',
         cfg=True,
         p_uncond=0.1
+    )
+
+    config.fid = d(  # FID of the EMA model at every checkpoint (train.save_interval) from step `start` on
+        start=100000,
+        n_samples=50000,  # 50 per class
+        mini_batch_size=125,  # per GPU: sampling holds the 66816-channel skip concat, ~0.23 GiB per image
+        num_steps=50,  # Euler steps, as eval.py
+        cfg_scale=1.0,  # 1: no guidance; > 1: classifier-free guidance for t <= guidance_high
+        guidance_high=0.7,
     )
 
     config.sample = d(

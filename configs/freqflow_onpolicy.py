@@ -33,8 +33,11 @@ def get_config():
         cfg_scale=1.0,           # sampler convention: v_u + s (v_c - v_u), applied only for
         guidance_low=0.0,        # guidance_low <= t <= guidance_high; the default band sits
         guidance_high=0.7,       # above 0.7, so it is unguided whatever cfg_scale is
-        band_t_min=0.875,        # band = sampler grid states with t > band_t_min (t=1 is noise)
-        n_roll=16,               # trajectories per GPU per micro-batch
+        band_t_min=0.8245,       # band = sampler grid states with t > band_t_min (t=1 is noise): 1, 0.9363, 0.878,
+                                 # 0.82456 (just above the split). At 0.82456 the exact empirical posterior is a
+                                 # nearest-neighbour lookup (ESS ~1-2)
+        n_roll=32,               # trajectories per GPU per micro-batch; CFG needs n_roll >= n_band (22 band rows of
+                                 # a 128-row micro-batch) and MMD needs mmd_n_target % (n_gpus * n_roll) == 0
 
         # expert posterior for the band's FM labels: exact (full) or a K-latent bank, no duplicates
         bank_full=True,          # conditional rows: whole class pool

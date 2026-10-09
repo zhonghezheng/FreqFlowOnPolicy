@@ -1,6 +1,7 @@
 from re import A
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 
 import torch.nn.functional as F
@@ -140,6 +141,8 @@ class SelfAttention(nn.Module):
         return x
 
 class TransformerBlock(nn.Module):
+    checkpoint = False  # recompute the block in backward instead of keeping its activations
+
     def __init__(self, config):
         super().__init__()
         self.block1 = SelfAttention(config)
@@ -147,7 +150,8 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(config.dropout_prob)
 
     def forward(self, x, condition_embeds, condition_masks, pos):
-        #return torch.utils.checkpoint.checkpoint(self._forward, x, condition_embeds, condition_masks, pos)
+        if self.checkpoint and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self._forward, x, condition_embeds, condition_masks, pos, use_reentrant=False)
         return self._forward(x, condition_embeds, condition_masks, pos)
     
     def _forward(self, x, condition_embeds, condition_masks, pos):
@@ -156,6 +160,8 @@ class TransformerBlock(nn.Module):
         return x
     
 class ConvNeXtBlock(nn.Module):
+    checkpoint = False  # recompute the block in backward instead of keeping its activations
+
     def __init__(self, config):
         super().__init__()
         self.block1 = nn.Sequential(
@@ -167,7 +173,8 @@ class ConvNeXtBlock(nn.Module):
         self.dropout = nn.Dropout(config.dropout_prob)
 
     def forward(self, x, condition_embeds, condition_masks, pos):
-        #return torch.utils.checkpoint.checkpoint(self._forward, x, condition_embeds, condition_masks, pos)
+        if self.checkpoint and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self._forward, x, condition_embeds, condition_masks, pos, use_reentrant=False)
         return self._forward(x, condition_embeds, condition_masks, pos)
     
     def _forward(self, x, condition_embeds, condition_masks, pos):
@@ -205,6 +212,12 @@ class OutBlock(nn.Module):
         
 
 class Stage(nn.Module):
+    # recompute concat + upsample of the lower-resolution stage's skips in backward: the concat is
+    # dim * (num_blocks + 2) channels wide (66816 for FreqFlow-H), the largest activation in the model.
+    # One checkpoint per chunk of checkpoint_lowres_chunk samples, so backward holds one chunk's recompute at a time
+    checkpoint_lowres = False
+    checkpoint_lowres_chunk = 16
+
     def __init__(self, channels, config, lowres_dim = None, lowres_height = None):
         super().__init__()
         if config.block_type == "TransformerBlock":
@@ -269,7 +282,14 @@ class Stage(nn.Module):
             pos = None
 
         if lowres_skips is not None:
-            x = x + self.upsample(lowres_skips)
+            if self.checkpoint_lowres and torch.is_grad_enabled():
+                # split, not slice: slicing would make backward allocate a full-size gradient per skip per chunk
+                c = self.checkpoint_lowres_chunk
+                chunks = zip(*[skip.split(c) for skip in lowres_skips])
+                x = x + torch.cat([torch.utils.checkpoint.checkpoint(self._upsample_skips, list(chunk), slice(k * c, (k + 1) * c), use_reentrant=False)
+                                   for k, chunk in enumerate(chunks)])
+            else:
+                x = x + self._upsample_skips(lowres_skips)
 
         if self.encoder_cls is TransformerBlock:
             B, H, W, C = x.shape
@@ -310,6 +330,19 @@ class Stage(nn.Module):
 
         output = self.output_layer(x)
         return output, external_skips
+
+    def _upsample_skips(self, lowres_skips, rows = None):
+        # rows: the batch rows a chunk of lowres_skips covers, to use the matching per-sample time-dependent weights
+        tdps = [m for m in self.upsample.modules() if isinstance(m, TimeDependentParameter)] if rows is not None else []
+        full = [t.curr_weight for t in tdps]
+        for t in tdps:
+            if t.curr_weight.shape[0] > 1:
+                t.curr_weight = t.curr_weight[rows]
+        try:
+            return self.upsample(torch.cat(lowres_skips, dim = -1))
+        finally:
+            for t, w in zip(tdps, full):
+                t.curr_weight = w
     
 
 class FreqFlow(nn.Module):
@@ -357,11 +390,9 @@ class FreqFlow(nn.Module):
                 low_x, high_x = Fourier_filter(images, D=8)
                 output, lowres_skips = stage(torch.cat([low_x, high_x], dim=1), lowres_skips = lowres_skips, condition_classes = condition_classes, condition_embeds = condition_embeds, condition_masks = condition_masks)
                 outputs.append(output)
-                lowres_skips = torch.cat(lowres_skips, dim = -1)
             else:
                 output, lowres_skips = stage(images, lowres_skips = lowres_skips, condition_classes = condition_classes, condition_embeds = condition_embeds, condition_masks = condition_masks)
                 outputs.append(output)
-                lowres_skips = torch.cat(lowres_skips, dim = -1)
 
 
         return outputs

@@ -14,6 +14,8 @@ dependencies = [
     "tqdm>=4.65",
     "numpy>=1.24",
     "pillow>=9.0",
+    "pytorch-fid>=0.3.0",
+    "scipy>=1.17.1",
 ]
 
 [tool.uv]

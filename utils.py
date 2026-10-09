@@ -43,12 +43,15 @@ def set_seed(seed: int):
         np.random.seed(seed)
 
 
-def get_optimizer(params, name, **kwargs):
+def get_optimizer(params, name, zero=False, **kwargs):
     if name == 'adam':
         from torch.optim import Adam
         return Adam(params, **kwargs)
     elif name == 'adamw':
         from torch.optim import AdamW
+        if zero:  # ZeRO-1: each rank keeps the AdamW state of only its shard of the parameters
+            from torch.distributed.optim import ZeroRedundancyOptimizer
+            return ZeroRedundancyOptimizer(params, optimizer_class=AdamW, **kwargs)
         return AdamW(params, **kwargs)
     else:
         raise NotImplementedError(name)
@@ -107,6 +110,10 @@ class TrainState(object):
         for key, val in self.__dict__.items():
             if key != 'step' and val is not None:
                 val.load_state_dict(torch.load(os.path.join(path, f'{key}.pth'), map_location='cpu'))
+        if is_zero(self.optimizer):
+            # ZeroRedundancyOptimizer.load_state_dict also leaves a copy of this rank's shard of the state in the
+            # wrapper; only its local optimizer's copy is used
+            self.optimizer.state.clear()
 
     def resume(self, ckpt_root, step=None):
         if not os.path.exists(ckpt_root):
@@ -148,20 +155,59 @@ def trainable_parameters(nnet):
     return params
 
 
+def is_zero(optimizer):
+    from torch.distributed.optim import ZeroRedundancyOptimizer
+    return isinstance(optimizer, ZeroRedundancyOptimizer)
+
+
+class ShardedEMA:
+    """EMA of only the parameters this rank's ZeroRedundancyOptimizer updates; the ranks' shards are disjoint.
+
+    Replaces a full EMA copy of the model on every GPU. gather() assembles the full EMA into nnet_ema on the
+    ranks that pass here=True; it is collective, so every rank must call it.
+    """
+
+    def __init__(self, nnet, nnet_ema, optimizer):
+        owner = optimizer._param_to_rank  # the partition the optimizer steps; torch has no public accessor
+        ema_params = dict(nnet_ema.named_parameters())
+        self.rank = optimizer.rank
+        self.params = list(nnet.named_parameters())  # same order on every rank
+        self.owner = [owner[p] for _, p in self.params]
+        mine = [(n, p) for (n, p), r in zip(self.params, self.owner) if r == self.rank]
+        self.src = [p for _, p in mine]
+        self.ema = [ema_params[n].detach().to(p.device, copy=True) for n, p in mine]
+
+    @torch.no_grad()
+    def update(self, rate):
+        torch._foreach_mul_(self.ema, rate)
+        torch._foreach_add_(self.ema, self.src, alpha=1 - rate)
+
+    @torch.no_grad()
+    def gather(self, nnet_ema, here):
+        ema_params = dict(nnet_ema.named_parameters())
+        mine = iter(self.ema)
+        for (name, p), r in zip(self.params, self.owner):
+            buf = next(mine) if r == self.rank else torch.empty_like(p)
+            torch.distributed.broadcast(buf, src=r)
+            if here:
+                ema_params[name].copy_(buf)
+
+
 def initialize_train_state(config, device):
 
     nnet = get_nnet(**config.nnet)
     nnet_ema = get_nnet(**config.nnet)
     nnet_ema.eval()
     logging.info(f'nnet has {cnt_params(nnet)} parameters')
+    nnet.to(device)  # before the optimizer: ZeroRedundancyOptimizer communicates on its parameters' device
 
     optimizer = get_optimizer(trainable_parameters(nnet), **config.optimizer)
     lr_scheduler = get_lr_scheduler(optimizer, **config.lr_scheduler)
 
     train_state = TrainState(optimizer=optimizer, lr_scheduler=lr_scheduler, step=0,
                              nnet=nnet, nnet_ema=nnet_ema)
-    train_state.ema_update(0)
     train_state.to(device)
+    train_state.ema_update(0)
     return train_state
 
 

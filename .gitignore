@@ -4,3 +4,4 @@ workdir/
 wandb/
 assets/
 slurm/logs/
+uv.lock
