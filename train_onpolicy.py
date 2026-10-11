@@ -100,6 +100,15 @@ def train(config):
                                       num_workers=8, pin_memory=True, persistent_workers=True)
 
     train_state = utils.initialize_train_state(config, device)
+    if config.nnet.name == 'freqflow':  # memory options, as train_ldm_discrete.py: same math, up to float rounding
+        from libs.ours.blocks_RoPERMSNorm import ConvNeXtBlock, Stage, TransformerBlock
+        # a block's recompute reads the TimeDependentParameter weights its model call seeded: every backward here
+        # runs before the next model call, and the rollout's checkpoint re-seeds each step
+        for m in train_state.nnet.modules():
+            if isinstance(m, Stage):
+                m.checkpoint_lowres = config.train.get('checkpoint_lowres', False)
+            if isinstance(m, (TransformerBlock, ConvNeXtBlock)):
+                m.checkpoint = config.train.get('checkpoint_blocks', False)
     nnet, nnet_ema, optimizer, train_dataset_loader = accelerator.prepare(
         train_state.nnet, train_state.nnet_ema, train_state.optimizer, train_dataset_loader)
     lr_scheduler = train_state.lr_scheduler
@@ -301,7 +310,7 @@ def get_hparams():
     for i in range(1, len(argv)):
         assert '=' in argv[i]
         if argv[i].startswith('--config.') and not argv[i].startswith('--config.dataset.path'):
-            hparam, val = argv[i].split('=')
+            hparam, val = argv[i].split('=', 1)  # a path value may hold '=' (workdir/<config>/<hparams>/...)
             hparam = hparam.split('.')[-1]
             if hparam.endswith('path'):
                 val = Path(val).stem

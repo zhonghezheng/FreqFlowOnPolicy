@@ -18,6 +18,10 @@ def get_config():
     config.ema_rate = 0.9999
     config.train.n_steps = 20000
     config.train.grad_accum = 1      # micro-batches per optimizer step; batch_size is the global batch
+    # recompute the blocks and the skip concat in backward (configs/freqflow_l.py): FreqFlow-L's eager activations
+    # do not fit a 128-row micro-batch in 80 GB otherwise
+    config.train.checkpoint_blocks = True
+    config.train.checkpoint_lowres = True
     config.train.save_interval = 2000
     config.train.eval_interval = 1000  # sample grid every N steps (needs the autoencoder); 0 = off
     config.optimizer.lr = 1e-5
