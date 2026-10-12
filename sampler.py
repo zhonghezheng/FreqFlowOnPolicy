@@ -53,11 +53,12 @@ def euler_sampler(
         guidance_low=0.0,
         guidance_high=1.0,
         path_type="linear", # not used, just for compatability
+        state_callback=None,  # state_callback(x, t) -> x at every state before its model eval (mmd_guidance.py)
         ):
     # setup conditioning
     if cfg_scale > 1.0:
         y_null = torch.tensor([1000] * y.size(0), device=y.device)
-    _dtype = latents.dtype    
+    _dtype = latents.dtype
     steps = list(range(0, 1001, 20))[::-1]
     scale_steps=[]
     for i in steps:
@@ -76,12 +77,14 @@ def euler_sampler(
     with torch.cuda.amp.autocast():
         for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
             x_cur = x_next
+            if state_callback is not None:
+                x_cur = state_callback(x_cur, float(t_cur))
             if cfg_scale > 1.0 and t_cur <= guidance_high and t_cur >= guidance_low:
                 model_input = torch.cat([x_cur] * 2, dim=0)
                 y_cur = torch.cat([y, y_null], dim=0)
             else:
                 model_input = x_cur
-                y_cur = y            
+                y_cur = y
             kwargs = dict(y=y_cur)
             time_input = torch.ones(model_input.size(0)).to(device=device, dtype=torch.float64) * t_cur
             d_cur = model(
